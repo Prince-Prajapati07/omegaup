@@ -16,10 +16,21 @@ class _FakeCursor:
 
     def __init__(self, problem_ids: List[int]) -> None:
         self._problem_ids = problem_ids
+        self._last_query = ''
 
     def execute(self, query: str, params: Any = None) -> None:
         '''Executes a fake SQL query without touching a real database.'''
-        del query, params
+        self._last_query = query
+        del params
+
+    def fetchone(self) -> Any:
+        '''Returns one fake row for single-row queries.'''
+        if 'last_processed_qualitynomination_id' in self._last_query:
+            return (aggregate_feedback.QUALITYNOMINATION_QUESTION_CHANGE_ID,)
+        if 'MAX(qn.`qualitynomination_id`)' in self._last_query:
+            return (aggregate_feedback.QUALITYNOMINATION_QUESTION_CHANGE_ID
+                    + 100,)
+        return None
 
     def fetchall(self) -> List[Tuple[int]]:
         '''Returns all fake problem_id rows for this cursor.'''
@@ -111,6 +122,155 @@ class AggregateFeedbackTest(unittest.TestCase):
         self.assertEqual(called_ids, problem_ids)
         self.assertEqual(dbconn.rollback_calls, 1)
 
+    def test_incremental_mode_processes_all_problems(self) -> None:
+        '''aggregate_feedback processes incremental problems with watermark.'''
+        problem_ids = [10, 20, 30]
+        dbconn = _FakeDBConnection(problem_ids)
+
+        called_ids: List[int] = []
+        updated_value = None
+
+        def fake_fill_rank_cutoffs(dbconn_arg: Any) -> Any:
+            del dbconn_arg
+            return []
+
+        def fake_get_global_averages(
+                dbconn_arg: Any, rank_cutoffs_arg: Any) -> Any:
+            del dbconn_arg, rank_cutoffs_arg
+            return (None, None)
+
+        def fake_get_last_processed(dbconn_arg: Any) -> int:
+            del dbconn_arg
+            return (
+                aggregate_feedback.QUALITYNOMINATION_QUESTION_CHANGE_ID + 1)
+
+        def fake_aggregate_problem_feedback(
+                dbconn_arg: Any,
+                problem_id: int,
+                rank_cutoffs_arg: Any,
+                global_quality_average_arg: Any,
+                global_difficulty_average_arg: Any) -> None:
+            del (dbconn_arg, rank_cutoffs_arg, global_quality_average_arg,
+                 global_difficulty_average_arg)
+            called_ids.append(problem_id)
+
+        def fake_get_current_max_id(dbconn_arg: Any) -> int:
+            del dbconn_arg
+            return expected_max_id
+
+        def fake_update_last_processed(dbconn_arg: Any, value: int) -> None:
+            nonlocal updated_value
+            del dbconn_arg
+            updated_value = value
+
+        expected_max_id = (
+            aggregate_feedback.QUALITYNOMINATION_QUESTION_CHANGE_ID + 2)
+
+        original_fill_rank_cutoffs = aggregate_feedback.fill_rank_cutoffs
+        original_get_global = (
+            aggregate_feedback.get_global_quality_and_difficulty_average)
+        original_get_last_processed = (
+            aggregate_feedback.get_last_processed_qualitynomination_id)
+        original_aggregate_problem_feedback = (
+            aggregate_feedback.aggregate_problem_feedback)
+        original_get_current_max_id = (
+            aggregate_feedback.get_current_max_qualitynomination_id)
+        original_update_last_processed = (
+            aggregate_feedback.update_last_processed_qualitynomination_id)
+
+        aggregate_feedback.fill_rank_cutoffs = cast(
+            Any, fake_fill_rank_cutoffs)
+        aggregate_feedback.get_global_quality_and_difficulty_average = cast(
+            Any, fake_get_global_averages)
+        aggregate_feedback.get_last_processed_qualitynomination_id = cast(
+            Any, fake_get_last_processed)
+        aggregate_feedback.aggregate_problem_feedback = cast(
+            Any, fake_aggregate_problem_feedback)
+        aggregate_feedback.get_current_max_qualitynomination_id = cast(
+            Any, fake_get_current_max_id)
+        aggregate_feedback.update_last_processed_qualitynomination_id = cast(
+            Any, fake_update_last_processed)
+
+        try:
+            aggregate_feedback.aggregate_feedback(cast(Any, dbconn))
+        finally:
+            aggregate_feedback.fill_rank_cutoffs = original_fill_rank_cutoffs
+            aggregate_feedback.get_global_quality_and_difficulty_average = (
+                original_get_global)
+            aggregate_feedback.get_last_processed_qualitynomination_id = (
+                original_get_last_processed)
+            aggregate_feedback.aggregate_problem_feedback = (
+                original_aggregate_problem_feedback)
+            aggregate_feedback.get_current_max_qualitynomination_id = (
+                original_get_current_max_id)
+            aggregate_feedback.update_last_processed_qualitynomination_id = (
+                original_update_last_processed)
+
+        self.assertEqual(called_ids, problem_ids)
+        self.assertEqual(updated_value, expected_max_id)
+
+
+class _FakeReviewerDBConnection:
+    '''Minimal db connection stub for
+    aggregate_feedback.aggregate_reviewers_feedback.'''
+
+    def __init__(self, problem_ids: List[int]) -> None:
+        self._problem_ids = problem_ids
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.conn = self
+
+    def cursor(self) -> _FakeCursor:
+        '''Creates a new fake cursor over the configured problem_ids.'''
+        return _FakeCursor(self._problem_ids)
+
+    def commit(self) -> None:
+        '''Records that a commit was requested on the fake connection.'''
+        self.commit_calls += 1
+
+    def rollback(self) -> None:
+        '''Records that a rollback was requested on the fake connection.'''
+        self.rollback_calls += 1
+
+
+class AggregateReviewersFeedbackTest(unittest.TestCase):
+    '''Tests for aggregate_feedback.aggregate_reviewers_feedback.'''
+
+    def test_single_problem_failure_does_not_stop_others(self) -> None:
+        '''One failing problem should not prevent others from updating.'''
+        problem_ids = [10, 20, 30]
+        failing_problem_id = 20
+        dbconn = _FakeReviewerDBConnection(problem_ids)
+
+        called_ids: List[int] = []
+
+        def fake_aggregate_reviewers_feedback_for_problem(
+                dbconn_arg: Any,
+                problem_id: int) -> None:
+            del dbconn_arg
+            called_ids.append(problem_id)
+            if problem_id == failing_problem_id:
+                raise RuntimeError('simulated failure for testing')
+
+        original = (
+            aggregate_feedback.aggregate_reviewers_feedback_for_problem)
+
+        aggregate_feedback.aggregate_reviewers_feedback_for_problem = cast(
+            Any, fake_aggregate_reviewers_feedback_for_problem)
+
+        try:
+            aggregate_feedback.aggregate_reviewers_feedback(
+                cast(Any, dbconn))
+        finally:
+            aggregate_feedback.aggregate_reviewers_feedback_for_problem = (
+                original)
+
+        # All three problems should have been attempted.
+        self.assertEqual(called_ids, problem_ids)
+        # One rollback for the failing problem.
+        self.assertEqual(dbconn.rollback_calls, 1)
+        # Two commits for the two successful problems.
+        self.assertEqual(dbconn.commit_calls, 2)
 
 if __name__ == '__main__':
     unittest.main()
