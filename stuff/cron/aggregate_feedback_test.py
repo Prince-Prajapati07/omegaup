@@ -272,5 +272,6 @@ class AggregateReviewersFeedbackTest(unittest.TestCase):
         # Two commits for the two successful problems.
         self.assertEqual(dbconn.commit_calls, 2)
 
+
 if __name__ == '__main__':
     unittest.main()

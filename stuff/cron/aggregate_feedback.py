@@ -580,8 +580,12 @@ def aggregate_reviewers_feedback(
                        FROM `QualityNominations` as qn
                        WHERE qn.`nomination` = 'quality_tag';""")
         for (problem_id, ) in cur.fetchall():
-            aggregate_reviewers_feedback_for_problem(dbconn, problem_id)
-        dbconn.conn.commit()
+            try:
+                aggregate_reviewers_feedback_for_problem(dbconn, problem_id)
+                dbconn.conn.commit()
+            except Exception:  # pylint: disable=broad-except
+                dbconn.conn.rollback()
+                continue
 
 
 def get_last_friday() -> datetime.date:
